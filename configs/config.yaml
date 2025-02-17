@@ -1,0 +1,19 @@
+TimesNet:
+    pred_len: 12
+    task_name: 'short_term_forecast'
+    seq_len: 12
+    label_len: 12
+    e_layers: 2
+    embed: 'timeF'
+    freq: 'h'
+    dropout: 0.1
+    top_k: 5
+    d_model: 256
+    d_ff: 256
+    factor: 3
+    num_kernels: 6
+    output_attention: False
+    distil: True
+    enc_in: 358 # num_of_vertices from dataset config
+    dec_in: 358
+    c_out: 358
