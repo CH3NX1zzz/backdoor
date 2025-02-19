@@ -7,6 +7,7 @@ from dataset import TimeDataset
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from tqdm import tqdm
+from importance_analysis import ImportanceAnalyzer
 
 class TemporalImputer:
     """
@@ -32,29 +33,42 @@ class TemporalImputer:
         self.max_iterations = max_iterations
         self.convergence_threshold = convergence_threshold
 
-    def calculate_temporal_weights(self, missing_indices: torch.Tensor) -> torch.Tensor:
+    def calculate_temporal_weights(self, missing_indices: torch.Tensor, importance_scores: torch.Tensor,
+                                   top_k: int = 5) -> torch.Tensor:
         """
-        计算时间步之间的距离权重
-        对于每个缺失值，计算其与最近的非缺失值的距离权重
+        计算重要时间步之间的距离权重
+        只针对最重要的k个时间步计算权重矩阵
 
         Args:
             missing_indices: 缺失值的索引张量
+            importance_scores: 每个时间步的重要性分数
+            top_k: 选择的重要时间步数量
 
         Returns:
             weights: 距离权重张量
         """
+        # 确保top_k不超过时间步数量
         n_timesteps = missing_indices.size(0)
-        weights = torch.zeros(n_timesteps, n_timesteps)
+        top_k = min(top_k, n_timesteps)
 
+        # 找出最重要的k个时间步的索引
+        _, top_indices = torch.topk(importance_scores, top_k)
+
+        # 创建一个较小的权重矩阵，只包含重要时间步
+        weights = torch.zeros(n_timesteps, top_k)
+
+        # 计算这些重要时间步与所有时间步之间的距离权重
         for i in range(n_timesteps):
-            for j in range(n_timesteps):
-                if i != j:
+            for j, top_idx in enumerate(top_indices):
+                if i != top_idx:
                     # 计算时间步距离的指数衰减权重
-                    distance = abs(missing_indices[i] - missing_indices[j])
+                    distance = abs(missing_indices[i] - missing_indices[top_idx])
                     weights[i, j] = torch.exp(-distance / self.window_size)
 
         # 归一化权重
-        weights = F.normalize(weights, p=1, dim=1)
+        row_sums = weights.sum(dim=1, keepdim=True)
+        weights = torch.where(row_sums > 0, weights / row_sums, weights)
+
         return weights
 
     def smoothness_loss(self, values: torch.Tensor) -> torch.Tensor:
@@ -99,6 +113,64 @@ class TemporalImputer:
 
         return loss / (n * n)
 
+    def calculate_weights(self, data_length: int, missing_indices: torch.Tensor,
+                          importance_scores: torch.Tensor) -> torch.Tensor:
+        """
+        计算缺失值之间的时间权重关系
+        使用简化且稳健的方法计算权重，避免索引越界问题
+
+        Args:
+            data_length: 数据总长度
+            missing_indices: 缺失值的位置索引
+            importance_scores: 时间步重要性分数
+
+        Returns:
+            weights: 权重矩阵 [n_missing, n_missing]
+        """
+        # 1. 确保缺失索引在有效范围内
+        valid_indices = missing_indices[missing_indices < data_length]
+        if len(valid_indices) == 0:
+            return torch.ones(1, 1)  # 返回默认权重
+
+        # 2. 调整重要性分数长度，确保与数据长度匹配
+        if len(importance_scores) < data_length:
+            # 如果重要性分数不够长，用1进行补齐
+            pad_length = data_length - len(importance_scores)
+            importance_scores = torch.cat([
+                importance_scores,
+                torch.ones(pad_length, device=importance_scores.device)
+            ])
+        else:
+            # 如果重要性分数过长，进行截断
+            importance_scores = importance_scores[:data_length]
+
+        # 3. 创建距离矩阵，使用向量化操作
+        n_missing = len(valid_indices)
+        # 将索引展开成矩阵形式 [n_missing, 1] - [1, n_missing]
+        indices_matrix = valid_indices.view(-1, 1) - valid_indices.view(1, -1)
+        # 计算绝对距离
+        distances = torch.abs(indices_matrix)
+        # 使用广播计算权重矩阵
+        weights = 1.0 / (1.0 + distances)
+        # 将对角线置为0（不考虑自身）
+        weights.fill_diagonal_(0.0)
+
+        # 4. 计算重要性权重，使用索引操作
+        # 确保索引在范围内
+        valid_importance_indices = valid_indices[valid_indices < len(importance_scores)]
+        # 获取重要性分数
+        importance_weights = torch.ones(n_missing, device=weights.device)
+        importance_weights[:len(valid_importance_indices)] = importance_scores[valid_importance_indices]
+
+        # 6. 结合距离权重和重要性权重
+        weights = weights * importance_weights.unsqueeze(1)
+
+        # 7. 归一化权重
+        row_sums = weights.sum(dim=1, keepdim=True)
+        weights = torch.where(row_sums > 0, weights / row_sums, weights)
+
+        return weights
+
     def impute_missing_values(
             self,
             data: torch.Tensor,
@@ -106,7 +178,7 @@ class TemporalImputer:
             importance_scores: torch.Tensor
     ) -> Tuple[torch.Tensor, Dict]:
         """
-        优化填补缺失值
+        执行缺失值填补
 
         Args:
             data: 原始数据张量
@@ -117,108 +189,90 @@ class TemporalImputer:
             imputed_data: 填补后的数据
             metrics: 优化过程的指标
         """
-        # 初始化缺失值（使用临近值的平均值）
-        if len(data.shape) == 2:
-            data = data.unsqueeze(1)  # 添加nodes维度
-            missing_mask = missing_mask.unsqueeze(1)
-
+        # 1. 将数据迁移到正确的设备上
         device = next(self.model.parameters()).device
         data = data.to(device)
         missing_mask = missing_mask.to(device)
         importance_scores = importance_scores.to(device)
 
+        # 2. 初始化填补数据
         imputed_data = data.clone()
-        missing_indices = torch.where(missing_mask)[0].unique()
 
-        # 初始填充
+        # 3. 找出包含缺失值的时间步
+        missing_indices = torch.where(missing_mask.any(dim=-1))[0]
+        if len(missing_indices) == 0:
+            return imputed_data, {'total_loss': [], 'smoothness_loss': []}
+
+        # 4. 初始填充：使用窗口平均值
         for idx in missing_indices:
-            window_start = max(0, idx - self.window_size)
-            window_end = min(data.size(0), idx + self.window_size)
-            window_values = data[window_start:window_end]
-            valid_mask = ~missing_mask[window_start:window_end]
-            valid_values = window_values[~missing_mask[window_start:window_end]]
+            # 定义时间窗口范围
+            window_start = max(0, idx - self.window_size // 2)
+            window_end = min(data.shape[0], idx + self.window_size // 2)
 
-            if len(valid_values) > 0:
-                imputed_data[idx] = valid_values.mean()
-            else:
-                valid_mask_all = ~missing_mask
-                imputed_data[idx] = data[~missing_mask].mean()
+            # 获取窗口内的数据
+            window_data = data[window_start:window_end]
+            window_mask = missing_mask[window_start:window_end]
 
-        # 计算时间距离权重
-        temporal_weights = self.calculate_temporal_weights(missing_indices)
-        temporal_weights = temporal_weights.to(device)
+            # 对每个特征分别处理
+            for feature in range(data.shape[-1]):
+                if missing_mask[idx, feature]:
+                    # 获取当前特征的有效值
+                    valid_data = window_data[~window_mask[:, feature], feature]
+                    if len(valid_data) > 0:
+                        # 使用窗口内的平均值
+                        imputed_data[idx, feature] = valid_data.mean()
+                    else:
+                        # 如果窗口内没有有效值，使用整体平均值
+                        imputed_data[idx, feature] = data[~missing_mask[:, feature], feature].mean()
 
-        # 优化过程
-        imputed_values = imputed_data[missing_indices].clone().requires_grad_(True)
-        optimizer = torch.optim.Adam([imputed_values], lr=self.learning_rate)
+        # 5. 计算时间权重
+        weights = self.calculate_weights(
+            data_length=data.shape[0],
+            missing_indices=missing_indices,
+            importance_scores=importance_scores
+        )
 
-        metrics = {
-            'total_loss': [],
-            'smoothness_loss': [],
-            'temporal_loss': [],
-            'reconstruction_loss': []
-        }
+        # 6. 优化填补值
+        missing_values = imputed_data[missing_indices].clone().requires_grad_(True)
+        optimizer = torch.optim.Adam([missing_values], lr=self.learning_rate)
 
+        metrics = {'total_loss': [], 'smoothness_loss': []}
+
+        # 7. 迭代优化
         for iteration in range(self.max_iterations):
             optimizer.zero_grad()
 
-            # 更新缺失值
+            # 更新填补数据
             current_data = imputed_data.clone()
-            current_data[missing_indices] = imputed_values
-            if len(current_data.shape) == 2:
-                model_input = current_data.unsqueeze(0)  # [1, timestamps, features]
-            else:
-                model_input = current_data
+            current_data[missing_indices] = missing_values
 
-            print(f"Model input shape: {model_input.shape}")  # 调试信息
+            # 计算损失函数
+            smooth_loss = torch.mean(torch.diff(current_data, dim=0).pow(2))
+            consistency_loss = torch.mean(weights * torch.cdist(missing_values, missing_values))
 
-
-            seq_len = model_input.shape[1]
-            x_mark = torch.zeros(1, seq_len, 4).to(device)
-            dec_inp = torch.zeros(1, seq_len, model_input.shape[-1]).to(device)
-
-            # 计算重建损失
-            output = self.model(model_input, x_mark, dec_inp, None)
-            reconstruction_loss = F.mse_loss(output.squeeze(0), current_data)
-
-            # 计算平滑性损失
-            smooth_loss = self.smoothness_loss(current_data)
-
-            # 计算时间一致性损失
-            temporal_loss = self.temporal_consistency_loss(
-                imputed_values,
-                temporal_weights
-            )
-
-            # 基于重要性分数加权的总损失
-            importance_weights = importance_scores[missing_indices]
+            # 计算总损失
             total_loss = (
-                    reconstruction_loss +
-                    self.alpha_smooth * smooth_loss * importance_weights.mean() +
-                    self.alpha_temporal * temporal_loss * importance_weights.mean()
+                    smooth_loss * self.alpha_smooth +
+                    consistency_loss * self.alpha_temporal
             )
 
-            # 记录损失
+            # 记录损失值
             metrics['total_loss'].append(total_loss.item())
             metrics['smoothness_loss'].append(smooth_loss.item())
-            metrics['temporal_loss'].append(temporal_loss.item())
-            metrics['reconstruction_loss'].append(reconstruction_loss.item())
 
             # 反向传播和优化
             total_loss.backward()
             optimizer.step()
 
-            # 检查收敛
+            # 检查收敛性
             if iteration > 0:
-                loss_diff = abs(metrics['total_loss'][-1] - metrics['total_loss'][-2])
-                if loss_diff < self.convergence_threshold:
+                if abs(metrics['total_loss'][-1] - metrics['total_loss'][-2]) < self.convergence_threshold:
                     break
 
-        # 更新最终的填补值
-        imputed_data[missing_indices] = imputed_values.detach()
+        # 8. 更新最终填补值
+        imputed_data[missing_indices] = missing_values.detach()
 
         return imputed_data, metrics
-
 
 class ImputationTrainer:
     """
@@ -232,7 +286,7 @@ class ImputationTrainer:
             imputer: TemporalImputer,
             device: torch.device,
             learning_rate: float = 0.001,
-            num_epochs: int = 100,
+            num_epochs: int = 1,
             batch_size: int = 32,
             patience: int = 10
     ):
@@ -336,7 +390,7 @@ class ImputationTrainer:
                 smoothness_loss = self.imputer.smoothness_loss(imputed_data)
 
                 # 计算时间一致性损失
-                temporal_weights = self.imputer.calculate_temporal_weights(
+                temporal_weights = self.imputer.calculate_weights(
                     torch.where(missing_mask)[0]
                 )
                 temporal_loss = self.imputer.temporal_consistency_loss(
