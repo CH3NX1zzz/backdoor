@@ -32,7 +32,7 @@ class ModelManager:
         os.makedirs(model_dir, exist_ok=True)
 
         # 保存模型状态
-        model_path = os.path.join(model_dir, "saved_models/parameter")
+        model_path = os.path.join(model_dir, "saved_models")
         torch.save(model.state_dict(), model_path)
 
         # 保存元数据
